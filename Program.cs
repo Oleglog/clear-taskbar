@@ -12,7 +12,6 @@ static class Program
     // ========================= Константы =========================
 
     private const uint EVENT_SYSTEM_FOREGROUND = 0x0003;
-    private const uint EVENT_OBJECT_LOCATIONCHANGE = 0x800B;
     private const uint EVENT_OBJECT_CLOAKED = 0x8017;
     private const uint EVENT_OBJECT_UNCLOAKED = 0x8018;
     private const uint WINEVENT_OUTOFCONTEXT = 0;
@@ -57,7 +56,6 @@ static class Program
     private static readonly System.Windows.Forms.Timer _debounceTimer = new() { Interval = DebounceMs };
 
     private static IntPtr _hookForeground;
-    private static IntPtr _hookLocation;
     private static IntPtr _hookCloak;
 
     private static bool? _currentTransparentState; // кэш: taskbar не трогаем, пока ничего не изменилось
@@ -150,9 +148,6 @@ static class Program
         _debounceTimer.Tick += OnDebounceTick;
 
         _hookForeground = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
-            IntPtr.Zero, _winEventProc, 0, 0, WINEVENT_OUTOFCONTEXT);
-
-        _hookLocation = SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE,
             IntPtr.Zero, _winEventProc, 0, 0, WINEVENT_OUTOFCONTEXT);
 
         _hookCloak = SetWinEventHook(EVENT_OBJECT_CLOAKED, EVENT_OBJECT_UNCLOAKED,
@@ -396,9 +391,8 @@ static class Program
     private static void Cleanup()
     {
         if (_hookForeground != IntPtr.Zero) UnhookWinEvent(_hookForeground);
-        if (_hookLocation != IntPtr.Zero) UnhookWinEvent(_hookLocation);
         if (_hookCloak != IntPtr.Zero) UnhookWinEvent(_hookCloak);
-        _hookForeground = _hookLocation = _hookCloak = IntPtr.Zero;
+        _hookForeground = _hookCloak = IntPtr.Zero;
 
         _debounceTimer.Stop();
 
