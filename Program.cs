@@ -1,8 +1,10 @@
 using System;
 using System.Drawing;
+using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Windows.Forms;
+using Microsoft.Win32;
 
 namespace ClearTaskbar;
 
@@ -107,9 +109,26 @@ static class Program
         Cleanup();
     }
 
+    private const string RUN_REG_KEY = @"Software\Microsoft\Windows\CurrentVersion\Run";
+    private const string APP_NAME = "ClearTaskbar";
+
     private static void SetupTrayIcon()
     {
         var contextMenu = new ContextMenuStrip();
+
+        var startupItem = new ToolStripMenuItem("Запускать вместе с Windows")
+        {
+            CheckOnClick = true,
+            Checked = IsRunAtStartup()
+        };
+        startupItem.CheckedChanged += (s, e) =>
+        {
+            SetRunAtStartup(startupItem.Checked);
+        };
+        contextMenu.Items.Add(startupItem);
+
+        contextMenu.Items.Add(new ToolStripSeparator());
+
         var exitItem = new ToolStripMenuItem("Выход", null, (s, e) => Application.Exit());
         contextMenu.Items.Add(exitItem);
 
@@ -120,6 +139,39 @@ static class Program
             Text = "Clear Taskbar",
             Visible = true
         };
+    }
+
+    private static bool IsRunAtStartup()
+    {
+        try
+        {
+            using var key = Registry.CurrentUser.OpenSubKey(RUN_REG_KEY, false);
+            return key?.GetValue(APP_NAME) != null;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static void SetRunAtStartup(bool enable)
+    {
+        try
+        {
+            using var key = Registry.CurrentUser.OpenSubKey(RUN_REG_KEY, true);
+            if (key == null) return;
+
+            if (enable)
+            {
+                string exePath = Application.ExecutablePath;
+                key.SetValue(APP_NAME, $"\"{exePath}\"");
+            }
+            else
+            {
+                key.DeleteValue(APP_NAME, false);
+            }
+        }
+        catch { }
     }
 
     private static void UpdateTaskbarState()
