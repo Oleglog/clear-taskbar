@@ -1,9 +1,9 @@
-name: Build ClearTaskbar
+name: Release ClearTaskbar
 
 on:
   push:
-    branches: [ main, master ]
-  pull_request:
+    tags:
+      - 'v*'
     branches: [ main, master ]
   workflow_dispatch:
 
@@ -20,7 +20,16 @@ jobs:
       with:
         dotnet-version: 8.0.x
 
-    - name: Publish Single-File Executable
+    - name: Publish Framework-Dependent Executable (Compact ~160 KB)
+      run: >
+        dotnet publish ClearTaskbar.csproj
+        -c Release
+        -r win-x64
+        --self-contained false
+        -p:PublishSingleFile=true
+        -o ./publish-compact
+
+    - name: Publish Self-Contained Executable (Standalone)
       run: >
         dotnet publish ClearTaskbar.csproj
         -c Release
@@ -28,10 +37,30 @@ jobs:
         --self-contained true
         -p:PublishSingleFile=true
         -p:IncludeNativeLibrariesForSelfExtract=true
-        -o ./publish
+        -o ./publish-standalone
 
-    - name: Upload Artifact
+    - name: Rename binaries
+      run: |
+        Move-Item ./publish-compact/ClearTaskbar.exe ./publish-compact/ClearTaskbar-compact.exe
+        Move-Item ./publish-standalone/ClearTaskbar.exe ./publish-standalone/ClearTaskbar-standalone.exe
+
+    - name: Upload Compact Artifact
       uses: actions/upload-artifact@v4
       with:
-        name: ClearTaskbar-windows-x64
-        path: ./publish/ClearTaskbar.exe
+        name: ClearTaskbar-compact
+        path: ./publish-compact/ClearTaskbar-compact.exe
+
+    - name: Upload Standalone Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: ClearTaskbar-standalone
+        path: ./publish-standalone/ClearTaskbar-standalone.exe
+
+    - name: Create GitHub Release
+      if: startsWith(github.ref, 'refs/tags/')
+      uses: softprops/action-gh-release@v2
+      with:
+        files: |
+          ./publish-compact/ClearTaskbar-compact.exe
+          ./publish-standalone/ClearTaskbar-standalone.exe
+        generate_release_notes: true
