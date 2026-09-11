@@ -10,9 +10,6 @@ namespace ClearTaskbar;
 static class Program
 {
     private const uint EVENT_SYSTEM_FOREGROUND = 0x0003;
-    private const uint EVENT_OBJECT_LOCATIONCHANGE = 0x800B;
-    private const uint EVENT_OBJECT_SHOW = 0x8002;
-    private const uint EVENT_OBJECT_HIDE = 0x8003;
     private const uint EVENT_OBJECT_CLOAKED = 0x8017;
     private const uint EVENT_OBJECT_UNCLOAKED = 0x8018;
     private const uint WINEVENT_OUTOFCONTEXT = 0;
@@ -24,8 +21,6 @@ static class Program
     private const uint DWMWA_CLOAKED = 14;
 
     private static IntPtr _hookForeground;
-    private static IntPtr _hookShowHide;
-    private static IntPtr _hookLocation;
     private static IntPtr _hookCloak;
     private static WinEventDelegate? _winEventProc;
 
@@ -134,7 +129,7 @@ static class Program
 
         _winEventProc = new WinEventDelegate(OnWinEvent);
 
-        // Системные события Windows (0% CPU, процесс спит в ожидании событий):
+        // 1. Смена активного окна (только когда окно сменилось, при движении мыши НЕ вызывается!)
         _hookForeground = SetWinEventHook(
             EVENT_SYSTEM_FOREGROUND,
             EVENT_SYSTEM_FOREGROUND,
@@ -144,24 +139,7 @@ static class Program
             0,
             WINEVENT_OUTOFCONTEXT);
 
-        _hookLocation = SetWinEventHook(
-            EVENT_OBJECT_LOCATIONCHANGE,
-            EVENT_OBJECT_LOCATIONCHANGE,
-            IntPtr.Zero,
-            _winEventProc,
-            0,
-            0,
-            WINEVENT_OUTOFCONTEXT);
-
-        _hookShowHide = SetWinEventHook(
-            EVENT_OBJECT_SHOW,
-            EVENT_OBJECT_HIDE,
-            IntPtr.Zero,
-            _winEventProc,
-            0,
-            0,
-            WINEVENT_OUTOFCONTEXT);
-
+        // 2. Открытие/закрытие UWP меню Пуск (при движении мыши НЕ вызывается!)
         _hookCloak = SetWinEventHook(
             EVENT_OBJECT_CLOAKED,
             EVENT_OBJECT_UNCLOAKED,
@@ -171,7 +149,6 @@ static class Program
             0,
             WINEVENT_OUTOFCONTEXT);
 
-        // Первичная проверка при старте
         UpdateTaskbarState();
 
         Application.Run();
@@ -188,7 +165,6 @@ static class Program
         uint dwEventThread,
         uint dwmsEventTime)
     {
-        // Проверяем только оконные события (idObject == 0 означает OBJID_WINDOW)
         if (idObject == 0)
         {
             UpdateTaskbarState();
@@ -405,8 +381,6 @@ static class Program
     private static void Cleanup()
     {
         if (_hookForeground != IntPtr.Zero) UnhookWinEvent(_hookForeground);
-        if (_hookLocation != IntPtr.Zero) UnhookWinEvent(_hookLocation);
-        if (_hookShowHide != IntPtr.Zero) UnhookWinEvent(_hookShowHide);
         if (_hookCloak != IntPtr.Zero) UnhookWinEvent(_hookCloak);
 
         if (_trayIcon != null)
