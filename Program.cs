@@ -1,6 +1,5 @@
 using System;
 using System.Drawing;
-using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Windows.Forms;
@@ -10,15 +9,50 @@ namespace ClearTaskbar;
 
 static class Program
 {
+    private const uint EVENT_SYSTEM_FOREGROUND = 0x0003;
+    private const uint EVENT_OBJECT_LOCATIONCHANGE = 0x800B;
+    private const uint EVENT_OBJECT_SHOW = 0x8002;
+    private const uint EVENT_OBJECT_HIDE = 0x8003;
+    private const uint EVENT_OBJECT_CLOAKED = 0x8017;
+    private const uint EVENT_OBJECT_UNCLOAKED = 0x8018;
+    private const uint WINEVENT_OUTOFCONTEXT = 0;
+
     private const uint WM_DWMCOMPOSITIONCHANGED = 0x031E;
 
     private const int GWL_EXSTYLE = -20;
     private const long WS_EX_TOOLWINDOW = 0x00000080L;
     private const uint DWMWA_CLOAKED = 14;
 
-    private static System.Windows.Forms.Timer? _pollTimer;
+    private static IntPtr _hookForeground;
+    private static IntPtr _hookShowHide;
+    private static IntPtr _hookLocation;
+    private static IntPtr _hookCloak;
+    private static WinEventDelegate? _winEventProc;
+
     private static bool? _currentTransparentState = null;
     private static NotifyIcon? _trayIcon;
+
+    private delegate void WinEventDelegate(
+        IntPtr hWinEventHook,
+        uint eventType,
+        IntPtr hwnd,
+        int idObject,
+        int idChild,
+        uint dwEventThread,
+        uint dwmsEventTime);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr SetWinEventHook(
+        uint eventMin,
+        uint eventMax,
+        IntPtr hmodWinEventProc,
+        WinEventDelegate lpfnWinEventProc,
+        uint idProcess,
+        uint idThread,
+        uint dwFlags);
+
+    [DllImport("user32.dll")]
+    private static extern bool UnhookWinEvent(IntPtr hWinEventHook);
 
     [DllImport("user32.dll")]
     private static extern IntPtr GetForegroundWindow();
@@ -98,15 +132,67 @@ static class Program
 
         SetupTrayIcon();
 
-        _pollTimer = new System.Windows.Forms.Timer { Interval = 50 };
-        _pollTimer.Tick += (s, e) => UpdateTaskbarState();
-        _pollTimer.Start();
+        _winEventProc = new WinEventDelegate(OnWinEvent);
 
+        // Системные события Windows (0% CPU, процесс спит в ожидании событий):
+        _hookForeground = SetWinEventHook(
+            EVENT_SYSTEM_FOREGROUND,
+            EVENT_SYSTEM_FOREGROUND,
+            IntPtr.Zero,
+            _winEventProc,
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT);
+
+        _hookLocation = SetWinEventHook(
+            EVENT_OBJECT_LOCATIONCHANGE,
+            EVENT_OBJECT_LOCATIONCHANGE,
+            IntPtr.Zero,
+            _winEventProc,
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT);
+
+        _hookShowHide = SetWinEventHook(
+            EVENT_OBJECT_SHOW,
+            EVENT_OBJECT_HIDE,
+            IntPtr.Zero,
+            _winEventProc,
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT);
+
+        _hookCloak = SetWinEventHook(
+            EVENT_OBJECT_CLOAKED,
+            EVENT_OBJECT_UNCLOAKED,
+            IntPtr.Zero,
+            _winEventProc,
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT);
+
+        // Первичная проверка при старте
         UpdateTaskbarState();
 
         Application.Run();
 
         Cleanup();
+    }
+
+    private static void OnWinEvent(
+        IntPtr hWinEventHook,
+        uint eventType,
+        IntPtr hwnd,
+        int idObject,
+        int idChild,
+        uint dwEventThread,
+        uint dwmsEventTime)
+    {
+        // Проверяем только оконные события (idObject == 0 означает OBJID_WINDOW)
+        if (idObject == 0)
+        {
+            UpdateTaskbarState();
+        }
     }
 
     private const string RUN_REG_KEY = @"Software\Microsoft\Windows\CurrentVersion\Run";
@@ -176,23 +262,18 @@ static class Program
 
     private static void UpdateTaskbarState()
     {
-        // 1. Проверяем, есть ли ХОТЯ БЫ ОДНО видимое развернутое на весь экран окно
-        // Если на экране есть распахнутое окно (даже если поверх него открыли маленькое окошко) -> НЕПРОЗРАЧНО
         if (HasAnyMaximizedWindow())
         {
             ApplyState(false);
             return;
         }
 
-        // 2. Проверяем меню Пуск/Поиск:
-        // Если окно Пуска существует, видимо и НЕ замаскировано DWM -> НЕПРОЗРАЧНО
         if (IsStartMenuVisible())
         {
             ApplyState(false);
             return;
         }
 
-        // 3. Если нет распахнутых окон и закрыт Пуск (чистый рабочий стол или только маленькие окна) -> ПРОЗРАЧНО!
         ApplyState(true);
     }
 
@@ -228,28 +309,26 @@ static class Program
         EnumWindows((hWnd, lParam) =>
         {
             if (!IsWindowVisible(hWnd) || IsIconic(hWnd) || IsCloaked(hWnd))
-                return true; // продолжаем перебор
+                return true;
 
             long exStyle = GetWindowLong(hWnd, GWL_EXSTYLE);
             if ((exStyle & WS_EX_TOOLWINDOW) != 0)
-                return true; // пропускаем тулбары
+                return true;
 
-            var sb = new StringBuilder(256);
-            GetClassName(hWnd, sb, 256);
+            var sb = new StringBuilder(64);
+            GetClassName(hWnd, sb, 64);
             string cls = sb.ToString();
 
-            // Пропускаем системные окна и рабочий стол
             if (cls == "Progman" || cls == "WorkerW" || cls == "Shell_TrayWnd" || cls == "Shell_SecondaryTrayWnd" ||
                 cls == "Windows.UI.Core.CoreWindow")
             {
                 return true;
             }
 
-            // Нашли развернутое на весь экран окно приложения!
             if (IsZoomed(hWnd))
             {
                 foundMaximized = true;
-                return false; // останавливаем перебор
+                return false;
             }
 
             return true;
@@ -314,7 +393,7 @@ static class Program
 
         WINCOMPATTRDATA data = new WINCOMPATTRDATA
         {
-            Attribute = 19, // WCA_ACCENT_POLICY
+            Attribute = 19,
             Data = pData,
             SizeOfData = size
         };
@@ -325,8 +404,10 @@ static class Program
 
     private static void Cleanup()
     {
-        _pollTimer?.Stop();
-        _pollTimer?.Dispose();
+        if (_hookForeground != IntPtr.Zero) UnhookWinEvent(_hookForeground);
+        if (_hookLocation != IntPtr.Zero) UnhookWinEvent(_hookLocation);
+        if (_hookShowHide != IntPtr.Zero) UnhookWinEvent(_hookShowHide);
+        if (_hookCloak != IntPtr.Zero) UnhookWinEvent(_hookCloak);
 
         if (_trayIcon != null)
         {
