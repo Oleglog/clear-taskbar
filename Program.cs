@@ -561,7 +561,22 @@ public static unsafe class Program
         }
         else
         {
-            // Асинхронно уведомляем Explorer восстановить родной вид без блокировки потока
+            // Сбрасываем политику прозрачности обратно в дефолт
+            int* pDefaultPolicy = stackalloc int[4];
+            pDefaultPolicy[0] = 0; // ACCENT_DISABLED
+            pDefaultPolicy[1] = 0;
+            pDefaultPolicy[2] = 0;
+            pDefaultPolicy[3] = 0;
+
+            WINCOMPATTRDATA data = new()
+            {
+                Attribute  = WCA_ACCENT_POLICY,
+                Data       = (IntPtr)pDefaultPolicy,
+                SizeOfData = ACCENT_POLICY_SIZE
+            };
+            SetWindowCompositionAttribute(hTaskbar, ref data);
+
+            // Асинхронно уведомляем Explorer восстановить родную тему и размытие
             SendNotifyMessageW(hTaskbar, WM_DWMCOMPOSITIONCHANGED, (IntPtr)1, IntPtr.Zero);
         }
     }
@@ -689,7 +704,6 @@ public static unsafe class Program
 
             case WM_DISPLAYCHANGE:
             case WM_THEMECHANGED:
-            case WM_DWMCOMPOSITIONCHANGED:
             case WM_DWMCOLORIZATIONCOLORCHANGED:
             case WM_SETTINGCHANGE:
                 _taskbarsCount = 0; // Инвалидируем кэш: explorer мог сбросить accent
