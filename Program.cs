@@ -235,6 +235,9 @@ public static unsafe class Program
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     private static extern uint RegisterWindowMessageW(string lpString);
 
+    [DllImport("user32.dll")]
+    private static extern bool IsWindowVisible(IntPtr hWnd);
+
     [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW")]
     private static extern nint GetWindowLongPtr64(IntPtr hWnd, int nIndex);
 
@@ -429,6 +432,9 @@ public static unsafe class Program
         _systemMonitorCount = Math.Max(1, GetSystemMetrics(SM_CMONITORS));
         _opaqueMonitorsCount = 0;
 
+        // Проверяем Пуск / Поиск напрямую (в обход EnumWindows, так как они могут лежать на отдельных рабочих столах)
+        CheckStartOrSearchDirect();
+
         // Перечисляем окна: callback вернет 0 и прервет обход, как только все мониторы будут покрыты
         EnumWindows(&EnumWindowCallback, IntPtr.Zero);
 
@@ -478,6 +484,18 @@ public static unsafe class Program
 
         // Если все физические мониторы уже перекрыты максимизированными окнами — прерываем перечисление!
         return _opaqueMonitorsCount < _systemMonitorCount ? 1 : 0;
+    }
+
+    private static void CheckStartOrSearchDirect()
+    {
+        IntPtr h = IntPtr.Zero;
+        while ((h = FindWindowExW(IntPtr.Zero, h, CoreWindowClass, null)) != IntPtr.Zero)
+        {
+            if (IsWindowVisible(h) && !IsWindowCloaked(h) && IsStartOrSearchProcess(h))
+            {
+                AddOpaqueMonitorFromHwnd(h);
+            }
+        }
     }
 
     private static void AddOpaqueMonitorFromHwnd(IntPtr hWnd)
