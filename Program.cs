@@ -12,33 +12,40 @@ static class Program
     // ========================= Константы =========================
 
     private const uint EVENT_SYSTEM_FOREGROUND = 0x0003;
+    private const uint EVENT_SYSTEM_MINIMIZESTART = 0x0016;   // окно начало сворачиваться
+    private const uint EVENT_SYSTEM_MINIMIZEEND = 0x0017;     // окно восстановлено из свёрнутого
     private const uint EVENT_OBJECT_CLOAKED = 0x8017;
     private const uint EVENT_OBJECT_UNCLOAKED = 0x8018;
+    private const uint EVENT_OBJECT_LOCATIONCHANGE = 0x800B; // окно сменило позицию/размер
     private const uint WINEVENT_OUTOFCONTEXT = 0;
 
     private const uint WM_DWMCOMPOSITIONCHANGED = 0x031E;
+    private const uint SMTO_ABORTIFHUNG = 0x0002;
 
     private const int GWL_STYLE = -16;
     private const int GWL_EXSTYLE = -20;
+    private const long WS_MAXIMIZE = 0x01000000L;
     private const long WS_VISIBLE = 0x10000000L;
     private const long WS_MINIMIZE = 0x20000000L;
-    private const long WS_MAXIMIZE = 0x01000000L;
     private const long WS_EX_TOOLWINDOW = 0x00000080L;
 
     private const uint DWMWA_CLOAKED = 14;
-
-    /// <summary>idObject == 0 (OBJID_WINDOW) — событие относится к окну целиком, а не к его элементам.</summary>
     private const int OBJID_WINDOW = 0;
 
     private const string TaskbarClass = "Shell_TrayWnd";
     private const string SecondaryTaskbarClass = "Shell_SecondaryTrayWnd";
-    private const string CoreWindowClass = "Windows.UI.Core.CoreWindow";
+    private const string CoreWindowClass = "Windows.UI.Core.CoreWindow"; // Пуск/поиск
+    private const string AppFrameClass = "ApplicationFrameWindow";       // хост UWP-приложений
+
+    /// <summary>Схлопывание серии событий в один проход. В простое таймер остановлен.</summary>
+    private const int DebounceMs = 40;
 
     /// <summary>
-    /// Пауза «схлопывания» серии событий (Alt+Tab, открытие Пуска и т.п.).
-    /// Таймер одноразовый: пока событий нет — он остановлен, пробуждений потока ноль.
+    /// Хук LOCATIONCHANGE для процесса активного окна: ловит «Развернуть»/Win+Up/Down/привязки
+    /// ТЕКУЩЕГО окна. Хотите абсолютный минимум пробуждений — выключите: тогда состояние
+    /// обновится при следующей смене активного окна (как в исходной версии).
     /// </summary>
-    private const int DebounceMs = 40;
+    private const bool TrackActiveWindowResize = true;
 
     private const string RUN_REG_KEY = @"Software\Microsoft\Windows\CurrentVersion\Run";
     private const string APP_NAME = "ClearTaskbar";
@@ -47,20 +54,21 @@ static class Program
 
     private static Mutex? _singleInstanceMutex;
     private static NotifyIcon? _trayIcon;
+    private static BroadcastWindow? _broadcastWindow;
 
-    // Делегаты создаются один раз — на события не тратится ни байта.
     private static readonly WinEventDelegate _winEventProc = OnWinEvent;
     private static readonly EnumWindowsProc _maximizedEnumProc = HasMaximizedCallback;
-
-    // WinForms-таймер: WM_TIMER, без дополнительных потоков и без смены системного разрешения таймера.
     private static readonly System.Windows.Forms.Timer _debounceTimer = new() { Interval = DebounceMs };
 
-    private static IntPtr _hookForeground;
-    private static IntPtr _hookCloak;
+    private static IntPtr _hookForeground;  // смена активного окна
+    private static IntPtr _hookMinimize;    // свернули/восстановили окно
+    private static IntPtr _hookCloak;       // cloak UWP/оболочки
+    private static IntPtr _hookLocation;   // LOCATIONCHANGE только процесса активного окна
+    private static uint _locationHookPid;   // pid, на который сейчас смотрит _hookLocation
 
-    private static bool? _currentTransparentState; // кэш: taskbar не трогаем, пока ничего не изменилось
-    private static IntPtr _lastTaskbarHwnd;        // переживает перезапуск explorer
-    private static bool _foundMaximized;           // результат EnumWindows без замыканий
+    private static bool? _currentTransparentState; // кэш: taskbar не трогаем без изменений
+    private static IntPtr _lastTaskbarHwnd;         // переживает перезапуск explorer
+    private static bool _foundMaximized;            // результат EnumWindows без замыканий
 
     // Переиспользуемый буфер имени класса: ноль аллокаций в горячем пути.
     private static readonly char[] _classBuffer = new char[64];
@@ -79,7 +87,6 @@ static class Program
     [DllImport("user32.dll")]
     private static extern bool UnhookWinEvent(IntPtr hWinEventHook);
 
-    // Unicode-варианты: без ANSI-конвертаций, корректно для нелатинских заголовков («Поиск»).
     [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     private static extern IntPtr FindWindow(string lpClassName, string? lpWindowName);
 
@@ -96,6 +103,18 @@ static class Program
     [DllImport("user32.dll")]
     private static extern bool IsWindowVisible(IntPtr hWnd);
 
+    [DllImport("user32.dll")]
+    private static extern bool IsZoomed(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern uint RegisterWindowMessage(string lpString);
+
     [DllImport("user32.dll", EntryPoint = "GetWindowLongPtr")]
     private static extern IntPtr GetWindowLongPtr64(IntPtr hWnd, int nIndex);
 
@@ -107,7 +126,8 @@ static class Program
         out int pvAttribute, int cbAttribute);
 
     [DllImport("user32.dll", SetLastError = true)]
-    private static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+    private static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam,
+        uint fuFlags, uint uTimeout, out IntPtr lpdwResult);
 
     [DllImport("user32.dll")]
     private static extern int SetWindowCompositionAttribute(IntPtr hwnd, ref WINCOMPATTRDATA data);
@@ -137,29 +157,32 @@ static class Program
     [STAThread]
     static void Main()
     {
-        // Второй экземпляр лишь дублировал бы работу и «спорил» бы с первым за вид taskbar.
         _singleInstanceMutex = new Mutex(true, @"Local\ClearTaskbar.SingleInstance", out bool firstInstance);
         if (!firstInstance) return;
 
         ApplicationConfiguration.Initialize();
 
         SetupTrayIcon();
-
+        _broadcastWindow = new BroadcastWindow(); // невидимое окно: TaskbarCreated / смена мониторов
         _debounceTimer.Tick += OnDebounceTick;
 
         _hookForeground = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
             IntPtr.Zero, _winEventProc, 0, 0, WINEVENT_OUTOFCONTEXT);
 
+        _hookMinimize = SetWinEventHook(EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND,
+            IntPtr.Zero, _winEventProc, 0, 0, WINEVENT_OUTOFCONTEXT);
+
         _hookCloak = SetWinEventHook(EVENT_OBJECT_CLOAKED, EVENT_OBJECT_UNCLOAKED,
             IntPtr.Zero, _winEventProc, 0, 0, WINEVENT_OUTOFCONTEXT);
+
+        IntPtr fg = GetForegroundWindow();
+        if (fg != IntPtr.Zero) UpdateForegroundLocationHook(fg);
 
         UpdateTaskbarState(); // начальное состояние — сразу, без таймера
 
         try
         {
-            // Чистый цикл сообщений: без окон и постоянно работающих таймеров.
-            // Поток спит в GetMessage → в простое 0% CPU и почти нет context switch'ей.
-            Application.Run();
+            Application.Run(); // в простое поток спит в GetMessage: 0% CPU
         }
         finally
         {
@@ -172,20 +195,58 @@ static class Program
     private static void OnWinEvent(IntPtr hWinEventHook, uint eventType, IntPtr hwnd, int idObject,
         int idChild, uint dwEventThread, uint dwmsEventTime)
     {
-        // Только события самого окна, не его дочерних объектов/скроллбаров/каретки.
         if (idObject != OBJID_WINDOW || hwnd == IntPtr.Zero)
             return;
 
-        // CLOAKED/UNCLOAKED сыплются почти от всех UWP-окон системы (Store-приложения,
-        // тосты, поиск, виджеты). Нам важны только Пуск/поиск — дешёвая проверка класса
-        // отсекает подавляющее большинство событий ещё до EnumWindows и вызовов DWM.
-        if ((eventType == EVENT_OBJECT_CLOAKED || eventType == EVENT_OBJECT_UNCLOAKED)
-            && !ClassEquals(hwnd, CoreWindowClass))
+        switch (eventType)
         {
-            return;
+            case EVENT_SYSTEM_FOREGROUND:
+                UpdateForegroundLocationHook(hwnd);
+                ScheduleUpdate();
+                break;
+
+            case EVENT_SYSTEM_MINIMIZESTART:
+            case EVENT_SYSTEM_MINIMIZEEND:
+                ScheduleUpdate();
+                break;
+
+            case EVENT_OBJECT_CLOAKED:
+            case EVENT_OBJECT_UNCLOAKED:
+                if (ClassEquals(hwnd, CoreWindowClass) || ClassEquals(hwnd, AppFrameClass))
+                    ScheduleUpdate();
+                break;
+
+            case EVENT_OBJECT_LOCATIONCHANGE:
+                ScheduleUpdate();
+                break;
+        }
+    }
+
+    private static void UpdateForegroundLocationHook(IntPtr hwnd)
+    {
+        if (!TrackActiveWindowResize) return;
+
+        GetWindowThreadProcessId(hwnd, out uint pid);
+        if (pid == _locationHookPid)
+            return; // уже слушаем этот процесс
+
+        if (_hookLocation != IntPtr.Zero)
+        {
+            UnhookWinEvent(_hookLocation);
+            _hookLocation = IntPtr.Zero;
         }
 
-        // Серия событий схлопывается в один проход: если таймер уже тикает — ничего не делаем.
+        _locationHookPid = pid;
+
+        if (pid == 0 || pid == (uint)Environment.ProcessId)
+            return;
+
+        _hookLocation = SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE,
+            IntPtr.Zero, _winEventProc, pid, 0, WINEVENT_OUTOFCONTEXT);
+    }
+
+    private static void ScheduleUpdate()
+    {
         if (!_debounceTimer.Enabled)
             _debounceTimer.Start();
     }
@@ -208,8 +269,6 @@ static class Program
     {
         IntPtr taskbar = FindWindow(TaskbarClass, null);
 
-        // Выходим, если не изменилось ни состояние, ни сама панель задач
-        // (второе покрывает перезапуск explorer, чтобы состояние не «залипало»).
         if (_currentTransparentState == transparent && taskbar == _lastTaskbarHwnd)
             return;
 
@@ -218,24 +277,25 @@ static class Program
         SetTaskbarAppearance(transparent, taskbar);
     }
 
+    private static void ForceReapply()
+    {
+        _currentTransparentState = null;
+        _lastTaskbarHwnd = IntPtr.Zero;
+    }
+
     private static bool HasAnyMaximizedWindow()
     {
         _foundMaximized = false;
-        EnumWindows(_maximizedEnumProc, IntPtr.Zero); // делегат закэширован — без аллокаций
+        EnumWindows(_maximizedEnumProc, IntPtr.Zero);
         return _foundMaximized;
     }
 
     private static bool HasMaximizedCallback(IntPtr hWnd, IntPtr lParam)
     {
-        // ПОРЯДОК ПРОВЕРОК — главная оптимизация:
-        // 1) один дешёвый GetWindowLong(GWL_STYLE) заменяет сразу IsWindowVisible +
-        //    IsIconic + IsZoomed (это те же биты стиля) — 1 native-вызов вместо 3;
         long style = GetWindowLong(hWnd, GWL_STYLE);
         if ((style & WS_MAXIMIZE) == 0 || (style & WS_VISIBLE) == 0 || (style & WS_MINIMIZE) != 0)
             return true;
 
-        // 2) дорогой межпроцессный запрос к DWM — только для максимизированных окон
-        //    (обычно 0–2 окна, а не все видимые окна системы);
         if (IsCloaked(hWnd))
             return true;
 
@@ -243,23 +303,24 @@ static class Program
         if ((exStyle & WS_EX_TOOLWINDOW) != 0)
             return true;
 
-        // 3) GetClassName не посылает окну сообщений (читает кэш win32k) — дёшево;
-        //    буфер переиспользуется, строки не создаются (сравнение через Span).
         int len = GetClassName(hWnd, _classBuffer, _classBuffer.Length);
-        ReadOnlySpan<char> cls = _classBuffer.AsSpan(0, len);
+        ReadOnlySpan<char> cls = _classBuffer.AsSpan(0, Math.Max(len, 0));
         if (cls.SequenceEqual("Progman") || cls.SequenceEqual("WorkerW") ||
             cls.SequenceEqual(TaskbarClass) || cls.SequenceEqual(SecondaryTaskbarClass) ||
             cls.SequenceEqual(CoreWindowClass))
             return true;
 
+        if (!IsZoomed(hWnd))
+            return true;
+
         _foundMaximized = true;
-        return false; // ранний выход из EnumWindows
+        return false;
     }
 
     private static bool IsStartMenuVisible()
     {
-        // FindWindow — быстрый поиск по внутренним таблицам; вызывается редко, по событию.
         IntPtr startHwnd = FindWindow(CoreWindowClass, "Поиск");
+        if (startHwnd == IntPtr.Zero) startHwnd = FindWindow(CoreWindowClass, "Пуск");
         if (startHwnd == IntPtr.Zero) startHwnd = FindWindow(CoreWindowClass, "Start");
         if (startHwnd == IntPtr.Zero) startHwnd = FindWindow(CoreWindowClass, "Search");
 
@@ -272,7 +333,7 @@ static class Program
     private static bool ClassEquals(IntPtr hWnd, string className)
     {
         int len = GetClassName(hWnd, _classBuffer, _classBuffer.Length);
-        return _classBuffer.AsSpan(0, len).SequenceEqual(className);
+        return _classBuffer.AsSpan(0, Math.Max(len, 0)).SequenceEqual(className);
     }
 
     // ========================= Внешний вид taskbar =========================
@@ -283,18 +344,20 @@ static class Program
         {
             ApplyAccentPolicy(mainHwnd, 2, 2, 0);
 
-            IntPtr secHwnd = IntPtr.Zero;
-            while ((secHwnd = FindWindowEx(IntPtr.Zero, secHwnd, SecondaryTaskbarClass, null)) != IntPtr.Zero)
-                ApplyAccentPolicy(secHwnd, 2, 2, 0);
+            IntPtr sec = IntPtr.Zero;
+            while ((sec = FindWindowEx(IntPtr.Zero, sec, SecondaryTaskbarClass, null)) != IntPtr.Zero)
+                ApplyAccentPolicy(sec, 2, 2, 0);
         }
         else
         {
             if (mainHwnd != IntPtr.Zero)
-                SendMessage(mainHwnd, WM_DWMCOMPOSITIONCHANGED, (IntPtr)1, IntPtr.Zero);
+                SendMessageTimeout(mainHwnd, WM_DWMCOMPOSITIONCHANGED, (IntPtr)1, IntPtr.Zero,
+                    SMTO_ABORTIFHUNG, 500, out _);
 
-            IntPtr secHwnd = IntPtr.Zero;
-            while ((secHwnd = FindWindowEx(IntPtr.Zero, secHwnd, SecondaryTaskbarClass, null)) != IntPtr.Zero)
-                SendMessage(secHwnd, WM_DWMCOMPOSITIONCHANGED, (IntPtr)1, IntPtr.Zero);
+            IntPtr sec = IntPtr.Zero;
+            while ((sec = FindWindowEx(IntPtr.Zero, sec, SecondaryTaskbarClass, null)) != IntPtr.Zero)
+                SendMessageTimeout(sec, WM_DWMCOMPOSITIONCHANGED, (IntPtr)1, IntPtr.Zero,
+                    SMTO_ABORTIFHUNG, 500, out _);
         }
     }
 
@@ -302,7 +365,6 @@ static class Program
     {
         if (hwnd == IntPtr.Zero) return;
 
-        // Редкий путь (только при смене состояния) — аллокация здесь не критична.
         ACCENT_POLICY policy = new()
         {
             AccentState = accentState,
@@ -329,6 +391,35 @@ static class Program
         finally
         {
             Marshal.FreeHGlobal(pData);
+        }
+    }
+
+    // ========================= Broadcast-окно =========================
+
+    private sealed class BroadcastWindow : NativeWindow
+    {
+        private const int WM_DISPLAYCHANGE = 0x007E;
+        private static readonly int TaskbarCreated =
+            unchecked((int)RegisterWindowMessage("TaskbarCreated"));
+
+        public BroadcastWindow()
+        {
+            CreateHandle(new CreateParams
+            {
+                Caption = "ClearTaskbar_Broadcast",
+                Style = unchecked((int)0x80000000),         // WS_POPUP
+                ExStyle = 0x00000080 | 0x08000000          // WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
+            });
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            if (m.Msg == TaskbarCreated || m.Msg == WM_DISPLAYCHANGE)
+            {
+                ForceReapply();
+                ScheduleUpdate();
+            }
+            base.WndProc(ref m);
         }
     }
 
@@ -390,11 +481,18 @@ static class Program
 
     private static void Cleanup()
     {
-        if (_hookForeground != IntPtr.Zero) UnhookWinEvent(_hookForeground);
-        if (_hookCloak != IntPtr.Zero) UnhookWinEvent(_hookCloak);
-        _hookForeground = _hookCloak = IntPtr.Zero;
+        Unhook(ref _hookForeground);
+        Unhook(ref _hookMinimize);
+        Unhook(ref _hookCloak);
+        Unhook(ref _hookLocation);
 
         _debounceTimer.Stop();
+        _debounceTimer.Dispose();
+
+        SetTaskbarAppearance(false, FindWindow(TaskbarClass, null));
+
+        _broadcastWindow?.DestroyHandle();
+        _broadcastWindow = null;
 
         if (_trayIcon != null)
         {
@@ -402,9 +500,13 @@ static class Program
             _trayIcon.Dispose();
         }
 
-        // Вернуть панели задач стандартный вид.
-        SetTaskbarAppearance(false, FindWindow(TaskbarClass, null));
-
         _singleInstanceMutex?.Dispose();
+    }
+
+    private static void Unhook(ref IntPtr hook)
+    {
+        if (hook == IntPtr.Zero) return;
+        UnhookWinEvent(hook);
+        hook = IntPtr.Zero;
     }
 }
