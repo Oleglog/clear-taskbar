@@ -8,45 +8,15 @@ namespace ClearTaskbar;
 
 static class Program
 {
-    private const uint EVENT_SYSTEM_FOREGROUND = 0x0003;
-    private const uint EVENT_OBJECT_LOCATIONCHANGE = 0x800B;
-    private const uint WINEVENT_OUTOFCONTEXT = 0;
-
     private const uint WM_DWMCOMPOSITIONCHANGED = 0x031E;
 
     private const int GWL_EXSTYLE = -20;
     private const long WS_EX_TOOLWINDOW = 0x00000080L;
     private const uint DWMWA_CLOAKED = 14;
 
-    private static IntPtr _hookForeground;
-    private static IntPtr _hookLocation;
-    private static WinEventDelegate? _winEventProc;
-
     private static System.Windows.Forms.Timer? _pollTimer;
     private static bool? _currentTransparentState = null;
     private static NotifyIcon? _trayIcon;
-
-    private delegate void WinEventDelegate(
-        IntPtr hWinEventHook,
-        uint eventType,
-        IntPtr hwnd,
-        int idObject,
-        int idChild,
-        uint dwEventThread,
-        uint dwmsEventTime);
-
-    [DllImport("user32.dll")]
-    private static extern IntPtr SetWinEventHook(
-        uint eventMin,
-        uint eventMax,
-        IntPtr hmodWinEventProc,
-        WinEventDelegate lpfnWinEventProc,
-        uint idProcess,
-        uint idThread,
-        uint dwFlags);
-
-    [DllImport("user32.dll")]
-    private static extern bool UnhookWinEvent(IntPtr hWinEventHook);
 
     [DllImport("user32.dll")]
     private static extern IntPtr GetForegroundWindow();
@@ -59,9 +29,6 @@ static class Program
 
     [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Auto)]
     private static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
-
-    [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Auto)]
-    private static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern IntPtr FindWindow(string lpClassName, string? lpWindowName);
@@ -100,6 +67,11 @@ static class Program
     [DllImport("user32.dll")]
     private static extern int SetWindowCompositionAttribute(IntPtr hwnd, ref WINCOMPATTRDATA data);
 
+    private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    private static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+
     [StructLayout(LayoutKind.Sequential)]
     private struct WINCOMPATTRDATA
     {
@@ -122,34 +94,11 @@ static class Program
     {
         ApplicationConfiguration.Initialize();
 
-        _winEventProc = new WinEventDelegate(OnWinEvent);
+        SetupTrayIcon();
 
-        _hookForeground = SetWinEventHook(
-            EVENT_SYSTEM_FOREGROUND,
-            EVENT_SYSTEM_FOREGROUND,
-            IntPtr.Zero,
-            _winEventProc,
-            0,
-            0,
-            WINEVENT_OUTOFCONTEXT);
-
-        _hookLocation = SetWinEventHook(
-            EVENT_OBJECT_LOCATIONCHANGE,
-            EVENT_OBJECT_LOCATIONCHANGE,
-            IntPtr.Zero,
-            _winEventProc,
-            0,
-            0,
-            WINEVENT_OUTOFCONTEXT);
-
-        _pollTimer = new System.Windows.Forms.Timer
-        {
-            Interval = 40
-        };
+        _pollTimer = new System.Windows.Forms.Timer { Interval = 50 };
         _pollTimer.Tick += (s, e) => UpdateTaskbarState();
         _pollTimer.Start();
-
-        SetupTrayIcon();
 
         UpdateTaskbarState();
 
@@ -173,66 +122,26 @@ static class Program
         };
     }
 
-    private static void OnWinEvent(
-        IntPtr hWinEventHook,
-        uint eventType,
-        IntPtr hwnd,
-        int idObject,
-        int idChild,
-        uint dwEventThread,
-        uint dwmsEventTime)
-    {
-        UpdateTaskbarState();
-    }
-
     private static void UpdateTaskbarState()
     {
-        IntPtr fg = GetForegroundWindow();
-        if (fg == IntPtr.Zero)
-        {
-            ApplyState(true);
-            return;
-        }
-
-        var sbClass = new StringBuilder(256);
-        GetClassName(fg, sbClass, 256);
-        string className = sbClass.ToString();
-
-        // 1. Если активно меню «Пуск» или «Поиск» (Windows.UI.Core.CoreWindow) -> НЕПРОЗРАЧНО
-        if (className.Equals("Windows.UI.Core.CoreWindow", StringComparison.OrdinalIgnoreCase))
+        // 1. Проверяем, есть ли ХОТЯ БЫ ОДНО видимое развернутое на весь экран окно
+        // Если на экране есть распахнутое окно (даже если поверх него открыли маленькое окошко) -> НЕПРОЗРАЧНО
+        if (HasAnyMaximizedWindow())
         {
             ApplyState(false);
             return;
         }
 
-        // 2. Если активен рабочий стол:
-        // Классы: Progman (Program Manager), WorkerW, либо DesktopWindow
-        if (className == "Progman" || className == "WorkerW" || fg == GetDesktopWindow() || fg == GetShellWindow())
+        // 2. Проверяем меню Пуск/Поиск:
+        // Если окно Пуска существует, видимо и НЕ замаскировано DWM -> НЕПРОЗРАЧНО
+        if (IsStartMenuVisible())
         {
-            ApplyState(true);
+            ApplyState(false);
             return;
         }
 
-        // 3. Если активна сама панель задач (клик по ней, зажатие иконки в трее/таскбаре):
-        // Панель НЕ меняет прозрачность, сохраняя текущее состояние рабочего стола
-        if (className == "Shell_TrayWnd" || className == "Shell_SecondaryTrayWnd")
-        {
-            return;
-        }
-
-        // 4. Обычные окна приложений:
-        // Если окно свернуто (IsIconic) или скрыто через DWM -> прозрачно
-        if (IsIconic(fg) || IsCloaked(fg))
-        {
-            ApplyState(true);
-            return;
-        }
-
-        // Если это обычное окно:
-        // Непрозрачно ТОЛЬКО если оно развернуто на весь экран (IsZoomed == true)
-        // Если окно обычного размера (IsZoomed == false) -> ПРОЗРАЧНО!
-        bool isMaximized = IsZoomed(fg);
-        ApplyState(!isMaximized);
+        // 3. Если нет распахнутых окон и закрыт Пуск (чистый рабочий стол или только маленькие окна) -> ПРОЗРАЧНО!
+        ApplyState(true);
     }
 
     private static void ApplyState(bool transparent)
@@ -242,6 +151,59 @@ static class Program
             SetTaskbarAppearance(transparent);
             _currentTransparentState = transparent;
         }
+    }
+
+    private static bool IsStartMenuVisible()
+    {
+        IntPtr startHwnd = FindWindow("Windows.UI.Core.CoreWindow", "Поиск");
+        if (startHwnd == IntPtr.Zero)
+            startHwnd = FindWindow("Windows.UI.Core.CoreWindow", "Start");
+        if (startHwnd == IntPtr.Zero)
+            startHwnd = FindWindow("Windows.UI.Core.CoreWindow", "Search");
+
+        if (startHwnd != IntPtr.Zero && IsWindowVisible(startHwnd) && !IsCloaked(startHwnd))
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+    private static bool HasAnyMaximizedWindow()
+    {
+        bool foundMaximized = false;
+
+        EnumWindows((hWnd, lParam) =>
+        {
+            if (!IsWindowVisible(hWnd) || IsIconic(hWnd) || IsCloaked(hWnd))
+                return true; // продолжаем перебор
+
+            long exStyle = GetWindowLong(hWnd, GWL_EXSTYLE);
+            if ((exStyle & WS_EX_TOOLWINDOW) != 0)
+                return true; // пропускаем тулбары
+
+            var sb = new StringBuilder(256);
+            GetClassName(hWnd, sb, 256);
+            string cls = sb.ToString();
+
+            // Пропускаем системные окна и рабочий стол
+            if (cls == "Progman" || cls == "WorkerW" || cls == "Shell_TrayWnd" || cls == "Shell_SecondaryTrayWnd" ||
+                cls == "Windows.UI.Core.CoreWindow")
+            {
+                return true;
+            }
+
+            // Нашли развернутое на весь экран окно приложения!
+            if (IsZoomed(hWnd))
+            {
+                foundMaximized = true;
+                return false; // останавливаем перебор
+            }
+
+            return true;
+        }, IntPtr.Zero);
+
+        return foundMaximized;
     }
 
     private static bool IsCloaked(IntPtr hwnd)
@@ -259,7 +221,6 @@ static class Program
 
         if (transparent)
         {
-            // Полная прозрачность
             ApplyAccentPolicy(mainHwnd, 2, 2, 0);
 
             IntPtr secHwnd = IntPtr.Zero;
@@ -270,7 +231,6 @@ static class Program
         }
         else
         {
-            // Системный возврат к оригинальной теме
             if (mainHwnd != IntPtr.Zero)
             {
                 SendMessage(mainHwnd, WM_DWMCOMPOSITIONCHANGED, (IntPtr)1, IntPtr.Zero);
@@ -286,8 +246,7 @@ static class Program
 
     private static void ApplyAccentPolicy(IntPtr hwnd, int accentState, int accentFlags, int color)
     {
-        if (hwnd == IntPtr.Zero)
-            return;
+        if (hwnd == IntPtr.Zero) return;
 
         ACCENT_POLICY policy = new ACCENT_POLICY
         {
@@ -316,9 +275,6 @@ static class Program
     {
         _pollTimer?.Stop();
         _pollTimer?.Dispose();
-
-        if (_hookForeground != IntPtr.Zero) UnhookWinEvent(_hookForeground);
-        if (_hookLocation != IntPtr.Zero) UnhookWinEvent(_hookLocation);
 
         if (_trayIcon != null)
         {
