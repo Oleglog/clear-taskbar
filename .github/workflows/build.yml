@@ -22,47 +22,28 @@ jobs:
       with:
         dotnet-version: 8.0.x
 
-    - name: Publish Framework-Dependent Executable (Compact ~160 KB)
+    - name: Publish Native AOT Executable
       run: >
         dotnet publish ClearTaskbar.csproj
         -c Release
         -r win-x64
-        --self-contained false
-        -p:PublishSingleFile=true
-        -o ./publish-compact
+        -p:PublishAot=true
+        -o ./publish-aot
 
-    - name: Publish Self-Contained Executable (Standalone)
-      run: >
-        dotnet publish ClearTaskbar.csproj
-        -c Release
-        -r win-x64
-        --self-contained true
-        -p:PublishSingleFile=true
-        -p:IncludeNativeLibrariesForSelfExtract=true
-        -o ./publish-standalone
-
-    - name: Rename binaries
+    - name: Rename binary
       run: |
-        Move-Item ./publish-compact/ClearTaskbar.exe ./publish-compact/ClearTaskbar-compact.exe
-        Move-Item ./publish-standalone/ClearTaskbar.exe ./publish-standalone/ClearTaskbar-standalone.exe
+        Move-Item ./publish-aot/ClearTaskbar.exe ./publish-aot/ClearTaskbar-aot.exe
 
-    - name: Upload Compact Artifact
+    - name: Upload AOT Artifact
       uses: actions/upload-artifact@v4
       with:
-        name: ClearTaskbar-compact
-        path: ./publish-compact/ClearTaskbar-compact.exe
-
-    - name: Upload Standalone Artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: ClearTaskbar-standalone
-        path: ./publish-standalone/ClearTaskbar-standalone.exe
+        name: ClearTaskbar-aot
+        path: ./publish-aot/ClearTaskbar-aot.exe
 
     - name: Create GitHub Release
       if: startsWith(github.ref, 'refs/tags/')
       uses: softprops/action-gh-release@v2
       with:
         files: |
-          ./publish-compact/ClearTaskbar-compact.exe
-          ./publish-standalone/ClearTaskbar-standalone.exe
+          ./publish-aot/ClearTaskbar-aot.exe
         generate_release_notes: true
