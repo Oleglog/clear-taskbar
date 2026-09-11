@@ -94,6 +94,7 @@ public static unsafe class Program
     private static readonly IntPtr[] _opaqueMonitors = new IntPtr[16];
     private static int _opaqueMonitorsCount = 0;
     private static int _systemMonitorCount  = 1;
+    private static IntPtr _desktopMonitor   = IntPtr.Zero;
 
     // Кэш панелей задач: чтобы повторно не долбить DWM при том же состоянии
     private struct TaskbarCache
@@ -158,6 +159,9 @@ public static unsafe class Program
 
     [StructLayout(LayoutKind.Sequential)]
     private struct POINT { public int X; public int Y; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
 
     [StructLayout(LayoutKind.Sequential)]
     private struct MSG
@@ -237,6 +241,18 @@ public static unsafe class Program
 
     [DllImport("user32.dll")]
     private static extern bool IsWindowVisible(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern bool IsIconic(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetShellWindow();
 
     [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW")]
     private static extern nint GetWindowLongPtr64(IntPtr hWnd, int nIndex);
@@ -435,6 +451,10 @@ public static unsafe class Program
         // Проверяем Пуск / Поиск напрямую (в обход EnumWindows, так как они могут лежать на отдельных рабочих столах)
         CheckStartOrSearchDirect();
 
+        // Проверяем, активен ли рабочий стол (если активен — фоновые развернутые окна не затемняют его)
+        IntPtr fg = GetForegroundWindow();
+        _desktopMonitor = IsDesktopWindow(fg) ? MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST) : IntPtr.Zero;
+
         // Перечисляем окна: callback вернет 0 и прервет обход, как только все мониторы будут покрыты
         EnumWindows(&EnumWindowCallback, IntPtr.Zero);
 
@@ -457,7 +477,12 @@ public static unsafe class Program
         long style = GetWindowLong(hWnd, GWL_STYLE);
 
         // Окно невидимо или свернуто -> пропускаем сразу
-        if ((style & WS_VISIBLE) == 0 || (style & WS_MINIMIZE) != 0)
+        if ((style & WS_VISIBLE) == 0 || (style & WS_MINIMIZE) != 0 || IsIconic(hWnd))
+            return 1;
+
+        // Отсекаем окна, свернутые за границы экрана (-32000, -32000)
+        RECT rc;
+        if (GetWindowRect(hWnd, out rc) && (rc.Left <= -30000 || rc.Top <= -30000))
             return 1;
 
         if ((style & WS_MAXIMIZE) != 0)
@@ -471,7 +496,13 @@ public static unsafe class Program
             if (IsWindowCloaked(hWnd))
                 return 1;
 
-            AddOpaqueMonitorFromHwnd(hWnd);
+            IntPtr hMonitor = MonitorFromWindow(hWnd, MONITOR_DEFAULTTONEAREST);
+
+            // Если на этом мониторе сейчас активен рабочий стол — окна позади него не должны затемнять панель
+            if (_desktopMonitor != IntPtr.Zero && (_systemMonitorCount == 1 || hMonitor == _desktopMonitor))
+                return 1;
+
+            AddOpaqueMonitor(hMonitor);
         }
         else if (IsClassCoreWindow(hWnd))
         {
@@ -498,9 +529,8 @@ public static unsafe class Program
         }
     }
 
-    private static void AddOpaqueMonitorFromHwnd(IntPtr hWnd)
+    private static void AddOpaqueMonitor(IntPtr hMonitor)
     {
-        IntPtr hMonitor = MonitorFromWindow(hWnd, MONITOR_DEFAULTTONEAREST);
         if (hMonitor == IntPtr.Zero) return;
 
         for (int i = 0; i < _opaqueMonitorsCount; i++)
@@ -511,6 +541,11 @@ public static unsafe class Program
 
         if (_opaqueMonitorsCount < _opaqueMonitors.Length)
             _opaqueMonitors[_opaqueMonitorsCount++] = hMonitor;
+    }
+
+    private static void AddOpaqueMonitorFromHwnd(IntPtr hWnd)
+    {
+        AddOpaqueMonitor(MonitorFromWindow(hWnd, MONITOR_DEFAULTTONEAREST));
     }
 
     private static bool IsMonitorOpaque(IntPtr hTaskbar)
@@ -599,6 +634,22 @@ public static unsafe class Program
                    cls.SequenceEqual("WorkerW") ||
                    cls.SequenceEqual(TaskbarClass) ||
                    cls.SequenceEqual(SecondaryTaskbarClass);
+        }
+    }
+
+    private static bool IsDesktopWindow(IntPtr hWnd)
+    {
+        if (hWnd == IntPtr.Zero) return true;
+        if (hWnd == GetShellWindow()) return true;
+
+        fixed (char* pBuf = _classBuffer)
+        {
+            int len = GetClassNameW(hWnd, pBuf, _classBuffer.Length);
+            if (len <= 0) return false;
+            ReadOnlySpan<char> cls = new(pBuf, len);
+
+            return cls.SequenceEqual("Progman") ||
+                   cls.SequenceEqual("WorkerW");
         }
     }
 
