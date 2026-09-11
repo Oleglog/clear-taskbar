@@ -32,6 +32,33 @@ static class Program
     private static bool? _currentTransparentState = null;
     private static NotifyIcon? _trayIcon;
 
+    private static IAppVisibility? _appVisibility;
+
+    // COM-интерфейс Windows 8/10 для 100% точного определения видимости Пуска
+    [ComImport]
+    [Guid("7E5FA9D0-1429-47E5-AB44-4861803E5C31")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IAppVisibility
+    {
+        [PreserveSig]
+        int GetAppVisibilityOnMonitor(IntPtr hMonitor, out int pMode);
+
+        [PreserveSig]
+        int IsLauncherVisible(out bool pfVisible);
+
+        [PreserveSig]
+        int Advise(IntPtr pCallback, out int pdwCookie);
+
+        [PreserveSig]
+        int Unadvise(int dwCookie);
+    }
+
+    [ComImport]
+    [Guid("762007A1-A22A-4A1B-AA0E-02C66A960B9E")]
+    private class AppVisibilityClass
+    {
+    }
+
     private delegate void WinEventDelegate(
         IntPtr hWinEventHook,
         uint eventType,
@@ -125,6 +152,15 @@ static class Program
     {
         ApplicationConfiguration.Initialize();
 
+        try
+        {
+            _appVisibility = (IAppVisibility)new AppVisibilityClass();
+        }
+        catch
+        {
+            _appVisibility = null;
+        }
+
         _winEventProc = new WinEventDelegate(OnWinEvent);
 
         _hookForeground = SetWinEventHook(
@@ -163,9 +199,10 @@ static class Program
             0,
             WINEVENT_OUTOFCONTEXT);
 
+        // Таймер для мгновенной реакции (50 мс, не потребляет CPU)
         _pollTimer = new System.Windows.Forms.Timer
         {
-            Interval = 100
+            Interval = 50
         };
         _pollTimer.Tick += (s, e) => UpdateTaskbarState();
         _pollTimer.Start();
@@ -208,26 +245,31 @@ static class Program
 
     private static void UpdateTaskbarState()
     {
-        // 1. Меню «Пуск», Поиск или Центр действий открыты -> возвращаем стандартный вид
-        if (IsStartOrFlyoutOpen())
+        // 1. Проверяем видимость меню «Пуск»
+        if (IsStartMenuVisible())
         {
             ApplyState(false);
             return;
         }
 
-        // 2. Проверяем активное окно на переднем плане
+        // 2. Активное окно
         IntPtr fg = GetForegroundWindow();
 
-        // Если активен рабочий стол или сама панель задач -> прозрачная
-        if (IsDesktopOrTaskbar(fg))
+        // 3. Клик по панели задач (например, зажали иконку чтобы свернуть/развернуть):
+        // Панель НЕ должна менять свой текущий режим при клике на неё саму!
+        if (IsTaskbarWindow(fg))
+        {
+            return;
+        }
+
+        // 4. Рабочий стол -> прозрачно
+        if (IsDesktopWindow(fg))
         {
             ApplyState(true);
             return;
         }
 
-        // 3. Если активно приложение:
-        // Панель должна становиться непрозрачной ТОЛЬКО если приложение развернуто на весь экран (IsZoomed)
-        // Если окно обычного размера (не на весь экран) -> панель остаётся прозрачной!
+        // 5. Окно пользователя: непрозрачно ТОЛЬКО если развернуто на весь экран
         if (IsNormalUserWindow(fg))
         {
             bool isMaximized = IsZoomed(fg);
@@ -235,7 +277,7 @@ static class Program
             return;
         }
 
-        // По умолчанию для неизвестных системных слоев
+        // В любых промежуточных состояниях сохраняем прозрачность
         ApplyState(true);
     }
 
@@ -248,31 +290,26 @@ static class Program
         }
     }
 
-    private static bool IsStartOrFlyoutOpen()
+    private static bool IsStartMenuVisible()
     {
-        // UWP-окна Windows 10: Пуск, Поиск, Центр действий
-        string[] titles = { "Start", "Search", "Action center" };
-        foreach (var title in titles)
+        // Официальный COM API Windows Shell
+        if (_appVisibility != null)
         {
-            IntPtr hwnd = FindWindow("Windows.UI.Core.CoreWindow", title);
-            if (hwnd != IntPtr.Zero && IsWindowVisible(hwnd) && !IsCloaked(hwnd))
+            try
             {
-                return true;
+                if (_appVisibility.IsLauncherVisible(out bool visible) == 0 && visible)
+                {
+                    return true;
+                }
             }
+            catch { }
         }
 
-        // Всплывающие меню системных значков в трее (громкость, сеть, дата/время)
-        IntPtr flyout = FindWindow("Windows.UI.Core.CoreWindow", null);
-        if (flyout != IntPtr.Zero && IsWindowVisible(flyout) && !IsCloaked(flyout))
+        // Страховка по окну Search / Cortana
+        IntPtr searchHwnd = FindWindow("Windows.UI.Core.CoreWindow", "Search");
+        if (searchHwnd != IntPtr.Zero && IsWindowVisible(searchHwnd) && !IsCloaked(searchHwnd))
         {
-            var sb = new StringBuilder(256);
-            GetClassName(flyout, sb, sb.Capacity);
-            if (sb.ToString() == "Windows.UI.Core.CoreWindow")
-            {
-                IntPtr fg = GetForegroundWindow();
-                if (fg == flyout)
-                    return true;
-            }
+            return true;
         }
 
         return false;
@@ -287,7 +324,19 @@ static class Program
         return false;
     }
 
-    private static bool IsDesktopOrTaskbar(IntPtr hwnd)
+    private static bool IsTaskbarWindow(IntPtr hwnd)
+    {
+        if (hwnd == IntPtr.Zero)
+            return false;
+
+        var sb = new StringBuilder(256);
+        GetClassName(hwnd, sb, sb.Capacity);
+        string className = sb.ToString();
+
+        return className == "Shell_TrayWnd" || className == "Shell_SecondaryTrayWnd";
+    }
+
+    private static bool IsDesktopWindow(IntPtr hwnd)
     {
         if (hwnd == IntPtr.Zero || hwnd == GetDesktopWindow() || hwnd == GetShellWindow())
             return true;
@@ -296,10 +345,7 @@ static class Program
         GetClassName(hwnd, sb, sb.Capacity);
         string className = sb.ToString();
 
-        return className == "Progman" ||
-               className == "WorkerW" ||
-               className == "Shell_TrayWnd" ||
-               className == "Shell_SecondaryTrayWnd";
+        return className == "Progman" || className == "WorkerW";
     }
 
     private static bool IsNormalUserWindow(IntPtr hwnd)
@@ -320,7 +366,6 @@ static class Program
 
         if (transparent)
         {
-            // ACCENT_ENABLE_TRANSPARENTGRADIENT: 100% прозрачно
             ApplyAccentPolicy(mainHwnd, 2, 2, 0);
 
             IntPtr secHwnd = IntPtr.Zero;
@@ -331,10 +376,6 @@ static class Program
         }
         else
         {
-            // Чтобы вернуть РОДНОЙ стиль Windows (без черной заливки),
-            // отправляем панели сообщение WM_DWMCOMPOSITIONCHANGED
-            // (так же, как делает TranslucentTB).
-            // Это заставляет Проводник перерисовать панель родными темами Windows 10.
             if (mainHwnd != IntPtr.Zero)
             {
                 SendMessage(mainHwnd, WM_DWMCOMPOSITIONCHANGED, (IntPtr)1, IntPtr.Zero);
