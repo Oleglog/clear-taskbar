@@ -26,60 +26,6 @@ static class Program
     private static bool? _currentTransparentState = null;
     private static NotifyIcon? _trayIcon;
 
-    private static IAppVisibility? _appVisibility;
-    private static int _appVisibilityCookie = 0;
-    private static AppVisibilitySink? _appVisibilitySink;
-
-    [ComImport]
-    [Guid("7E5FA9D0-1429-47E5-AB44-4861803E5C31")]
-    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-    private interface IAppVisibility
-    {
-        [PreserveSig]
-        int GetAppVisibilityOnMonitor(IntPtr hMonitor, out int pMode);
-
-        [PreserveSig]
-        int IsLauncherVisible(out bool pfVisible);
-
-        [PreserveSig]
-        int Advise(IAppVisibilityEvents pCallback, out int pdwCookie);
-
-        [PreserveSig]
-        int Unadvise(int dwCookie);
-    }
-
-    [ComImport]
-    [Guid("6524981C-032E-479D-AC7A-1658D32A1453")]
-    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-    private interface IAppVisibilityEvents
-    {
-        [PreserveSig]
-        int LauncherVisibilityChange(bool currentVisibleState);
-
-        [PreserveSig]
-        int AppVisibilityOnMonitorChanged(IntPtr hMonitor, int previousMode, int currentMode);
-    }
-
-    private class AppVisibilitySink : IAppVisibilityEvents
-    {
-        public int LauncherVisibilityChange(bool currentVisibleState)
-        {
-            UpdateTaskbarState();
-            return 0; // S_OK
-        }
-
-        public int AppVisibilityOnMonitorChanged(IntPtr hMonitor, int previousMode, int currentMode)
-        {
-            return 0; // S_OK
-        }
-    }
-
-    [ComImport]
-    [Guid("762007A1-A22A-4A1B-AA0E-02C66A960B9E")]
-    private class AppVisibilityClass
-    {
-    }
-
     private delegate void WinEventDelegate(
         IntPtr hWinEventHook,
         uint eventType,
@@ -113,6 +59,9 @@ static class Program
 
     [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Auto)]
     private static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
+
+    [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+    private static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern IntPtr FindWindow(string lpClassName, string? lpWindowName);
@@ -172,17 +121,6 @@ static class Program
     static void Main()
     {
         ApplicationConfiguration.Initialize();
-
-        try
-        {
-            _appVisibility = (IAppVisibility)new AppVisibilityClass();
-            _appVisibilitySink = new AppVisibilitySink();
-            _appVisibility.Advise(_appVisibilitySink, out _appVisibilityCookie);
-        }
-        catch
-        {
-            _appVisibility = null;
-        }
 
         _winEventProc = new WinEventDelegate(OnWinEvent);
 
@@ -249,34 +187,52 @@ static class Program
 
     private static void UpdateTaskbarState()
     {
-        // 1. Меню «Пуск» открыто -> непрозрачно
-        if (IsStartMenuVisible())
-        {
-            ApplyState(false);
-            return;
-        }
-
-        // 2. Окно на переднем плане
         IntPtr fg = GetForegroundWindow();
-
-        // 3. Рабочий стол или сама панель задач -> прозрачно
-        if (IsDesktopOrTaskbar(fg))
+        if (fg == IntPtr.Zero)
         {
             ApplyState(true);
             return;
         }
 
-        // 4. Окно приложения:
-        // Панель непрозрачна ТОЛЬКО если окно развернуто на весь экран
-        if (IsNormalUserWindow(fg))
+        var sbClass = new StringBuilder(256);
+        GetClassName(fg, sbClass, 256);
+        string className = sbClass.ToString();
+
+        // 1. Если активно меню «Пуск» или «Поиск» (Windows.UI.Core.CoreWindow) -> НЕПРОЗРАЧНО
+        if (className.Equals("Windows.UI.Core.CoreWindow", StringComparison.OrdinalIgnoreCase))
         {
-            bool isMaximized = IsZoomed(fg);
-            ApplyState(!isMaximized);
+            ApplyState(false);
             return;
         }
 
-        // 5. Любое другое невидимое или свернутое окно -> прозрачно
-        ApplyState(true);
+        // 2. Если активен рабочий стол:
+        // Классы: Progman (Program Manager), WorkerW, либо DesktopWindow
+        if (className == "Progman" || className == "WorkerW" || fg == GetDesktopWindow() || fg == GetShellWindow())
+        {
+            ApplyState(true);
+            return;
+        }
+
+        // 3. Если активна сама панель задач (клик по ней, зажатие иконки в трее/таскбаре):
+        // Панель НЕ меняет прозрачность, сохраняя текущее состояние рабочего стола
+        if (className == "Shell_TrayWnd" || className == "Shell_SecondaryTrayWnd")
+        {
+            return;
+        }
+
+        // 4. Обычные окна приложений:
+        // Если окно свернуто (IsIconic) или скрыто через DWM -> прозрачно
+        if (IsIconic(fg) || IsCloaked(fg))
+        {
+            ApplyState(true);
+            return;
+        }
+
+        // Если это обычное окно:
+        // Непрозрачно ТОЛЬКО если оно развернуто на весь экран (IsZoomed == true)
+        // Если окно обычного размера (IsZoomed == false) -> ПРОЗРАЧНО!
+        bool isMaximized = IsZoomed(fg);
+        ApplyState(!isMaximized);
     }
 
     private static void ApplyState(bool transparent)
@@ -288,29 +244,6 @@ static class Program
         }
     }
 
-    private static bool IsStartMenuVisible()
-    {
-        if (_appVisibility != null)
-        {
-            try
-            {
-                if (_appVisibility.IsLauncherVisible(out bool visible) == 0 && visible)
-                {
-                    return true;
-                }
-            }
-            catch { }
-        }
-
-        IntPtr searchHwnd = FindWindow("Windows.UI.Core.CoreWindow", "Search");
-        if (searchHwnd != IntPtr.Zero && IsWindowVisible(searchHwnd) && !IsCloaked(searchHwnd))
-        {
-            return true;
-        }
-
-        return false;
-    }
-
     private static bool IsCloaked(IntPtr hwnd)
     {
         if (DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, out int cloaked, sizeof(int)) == 0)
@@ -320,39 +253,13 @@ static class Program
         return false;
     }
 
-    private static bool IsDesktopOrTaskbar(IntPtr hwnd)
-    {
-        if (hwnd == IntPtr.Zero || hwnd == GetDesktopWindow() || hwnd == GetShellWindow())
-            return true;
-
-        var sb = new StringBuilder(256);
-        GetClassName(hwnd, sb, sb.Capacity);
-        string className = sb.ToString();
-
-        return className == "Progman" ||
-               className == "WorkerW" ||
-               className == "Shell_TrayWnd" ||
-               className == "Shell_SecondaryTrayWnd";
-    }
-
-    private static bool IsNormalUserWindow(IntPtr hwnd)
-    {
-        if (hwnd == IntPtr.Zero || !IsWindowVisible(hwnd) || IsIconic(hwnd) || IsCloaked(hwnd))
-            return false;
-
-        long exStyle = GetWindowLong(hwnd, GWL_EXSTYLE);
-        if ((exStyle & WS_EX_TOOLWINDOW) != 0)
-            return false;
-
-        return true;
-    }
-
     private static void SetTaskbarAppearance(bool transparent)
     {
         IntPtr mainHwnd = FindWindow("Shell_TrayWnd", null);
 
         if (transparent)
         {
+            // Полная прозрачность
             ApplyAccentPolicy(mainHwnd, 2, 2, 0);
 
             IntPtr secHwnd = IntPtr.Zero;
@@ -363,6 +270,7 @@ static class Program
         }
         else
         {
+            // Системный возврат к оригинальной теме
             if (mainHwnd != IntPtr.Zero)
             {
                 SendMessage(mainHwnd, WM_DWMCOMPOSITIONCHANGED, (IntPtr)1, IntPtr.Zero);
@@ -408,11 +316,6 @@ static class Program
     {
         _pollTimer?.Stop();
         _pollTimer?.Dispose();
-
-        if (_appVisibility != null && _appVisibilityCookie != 0)
-        {
-            try { _appVisibility.Unadvise(_appVisibilityCookie); } catch { }
-        }
 
         if (_hookForeground != IntPtr.Zero) UnhookWinEvent(_hookForeground);
         if (_hookLocation != IntPtr.Zero) UnhookWinEvent(_hookLocation);
