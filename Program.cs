@@ -9,11 +9,7 @@ namespace ClearTaskbar;
 static class Program
 {
     private const uint EVENT_SYSTEM_FOREGROUND = 0x0003;
-    private const uint EVENT_OBJECT_SHOW = 0x8002;
-    private const uint EVENT_OBJECT_HIDE = 0x8003;
     private const uint EVENT_OBJECT_LOCATIONCHANGE = 0x800B;
-    private const uint EVENT_OBJECT_CLOAKED = 0x8017;
-    private const uint EVENT_OBJECT_UNCLOAKED = 0x8018;
     private const uint WINEVENT_OUTOFCONTEXT = 0;
 
     private const uint WM_DWMCOMPOSITIONCHANGED = 0x031E;
@@ -23,9 +19,7 @@ static class Program
     private const uint DWMWA_CLOAKED = 14;
 
     private static IntPtr _hookForeground;
-    private static IntPtr _hookShowHide;
     private static IntPtr _hookLocation;
-    private static IntPtr _hookCloak;
     private static WinEventDelegate? _winEventProc;
 
     private static System.Windows.Forms.Timer? _pollTimer;
@@ -33,8 +27,9 @@ static class Program
     private static NotifyIcon? _trayIcon;
 
     private static IAppVisibility? _appVisibility;
+    private static int _appVisibilityCookie = 0;
+    private static AppVisibilitySink? _appVisibilitySink;
 
-    // COM-интерфейс Windows 8/10 для 100% точного определения видимости Пуска
     [ComImport]
     [Guid("7E5FA9D0-1429-47E5-AB44-4861803E5C31")]
     [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
@@ -47,10 +42,36 @@ static class Program
         int IsLauncherVisible(out bool pfVisible);
 
         [PreserveSig]
-        int Advise(IntPtr pCallback, out int pdwCookie);
+        int Advise(IAppVisibilityEvents pCallback, out int pdwCookie);
 
         [PreserveSig]
         int Unadvise(int dwCookie);
+    }
+
+    [ComImport]
+    [Guid("6524981C-032E-479D-AC7A-1658D32A1453")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IAppVisibilityEvents
+    {
+        [PreserveSig]
+        int LauncherVisibilityChange(bool currentVisibleState);
+
+        [PreserveSig]
+        int AppVisibilityOnMonitorChanged(IntPtr hMonitor, int previousMode, int currentMode);
+    }
+
+    private class AppVisibilitySink : IAppVisibilityEvents
+    {
+        public int LauncherVisibilityChange(bool currentVisibleState)
+        {
+            UpdateTaskbarState();
+            return 0; // S_OK
+        }
+
+        public int AppVisibilityOnMonitorChanged(IntPtr hMonitor, int previousMode, int currentMode)
+        {
+            return 0; // S_OK
+        }
     }
 
     [ComImport]
@@ -155,6 +176,8 @@ static class Program
         try
         {
             _appVisibility = (IAppVisibility)new AppVisibilityClass();
+            _appVisibilitySink = new AppVisibilitySink();
+            _appVisibility.Advise(_appVisibilitySink, out _appVisibilityCookie);
         }
         catch
         {
@@ -172,15 +195,6 @@ static class Program
             0,
             WINEVENT_OUTOFCONTEXT);
 
-        _hookShowHide = SetWinEventHook(
-            EVENT_OBJECT_SHOW,
-            EVENT_OBJECT_HIDE,
-            IntPtr.Zero,
-            _winEventProc,
-            0,
-            0,
-            WINEVENT_OUTOFCONTEXT);
-
         _hookLocation = SetWinEventHook(
             EVENT_OBJECT_LOCATIONCHANGE,
             EVENT_OBJECT_LOCATIONCHANGE,
@@ -190,19 +204,9 @@ static class Program
             0,
             WINEVENT_OUTOFCONTEXT);
 
-        _hookCloak = SetWinEventHook(
-            EVENT_OBJECT_CLOAKED,
-            EVENT_OBJECT_UNCLOAKED,
-            IntPtr.Zero,
-            _winEventProc,
-            0,
-            0,
-            WINEVENT_OUTOFCONTEXT);
-
-        // Таймер для мгновенной реакции (50 мс, не потребляет CPU)
         _pollTimer = new System.Windows.Forms.Timer
         {
-            Interval = 50
+            Interval = 40
         };
         _pollTimer.Tick += (s, e) => UpdateTaskbarState();
         _pollTimer.Start();
@@ -245,31 +249,25 @@ static class Program
 
     private static void UpdateTaskbarState()
     {
-        // 1. Проверяем видимость меню «Пуск»
+        // 1. Меню «Пуск» открыто -> непрозрачно
         if (IsStartMenuVisible())
         {
             ApplyState(false);
             return;
         }
 
-        // 2. Активное окно
+        // 2. Окно на переднем плане
         IntPtr fg = GetForegroundWindow();
 
-        // 3. Клик по панели задач (например, зажали иконку чтобы свернуть/развернуть):
-        // Панель НЕ должна менять свой текущий режим при клике на неё саму!
-        if (IsTaskbarWindow(fg))
-        {
-            return;
-        }
-
-        // 4. Рабочий стол -> прозрачно
-        if (IsDesktopWindow(fg))
+        // 3. Рабочий стол или сама панель задач -> прозрачно
+        if (IsDesktopOrTaskbar(fg))
         {
             ApplyState(true);
             return;
         }
 
-        // 5. Окно пользователя: непрозрачно ТОЛЬКО если развернуто на весь экран
+        // 4. Окно приложения:
+        // Панель непрозрачна ТОЛЬКО если окно развернуто на весь экран
         if (IsNormalUserWindow(fg))
         {
             bool isMaximized = IsZoomed(fg);
@@ -277,7 +275,7 @@ static class Program
             return;
         }
 
-        // В любых промежуточных состояниях сохраняем прозрачность
+        // 5. Любое другое невидимое или свернутое окно -> прозрачно
         ApplyState(true);
     }
 
@@ -292,7 +290,6 @@ static class Program
 
     private static bool IsStartMenuVisible()
     {
-        // Официальный COM API Windows Shell
         if (_appVisibility != null)
         {
             try
@@ -305,7 +302,6 @@ static class Program
             catch { }
         }
 
-        // Страховка по окну Search / Cortana
         IntPtr searchHwnd = FindWindow("Windows.UI.Core.CoreWindow", "Search");
         if (searchHwnd != IntPtr.Zero && IsWindowVisible(searchHwnd) && !IsCloaked(searchHwnd))
         {
@@ -324,19 +320,7 @@ static class Program
         return false;
     }
 
-    private static bool IsTaskbarWindow(IntPtr hwnd)
-    {
-        if (hwnd == IntPtr.Zero)
-            return false;
-
-        var sb = new StringBuilder(256);
-        GetClassName(hwnd, sb, sb.Capacity);
-        string className = sb.ToString();
-
-        return className == "Shell_TrayWnd" || className == "Shell_SecondaryTrayWnd";
-    }
-
-    private static bool IsDesktopWindow(IntPtr hwnd)
+    private static bool IsDesktopOrTaskbar(IntPtr hwnd)
     {
         if (hwnd == IntPtr.Zero || hwnd == GetDesktopWindow() || hwnd == GetShellWindow())
             return true;
@@ -345,7 +329,10 @@ static class Program
         GetClassName(hwnd, sb, sb.Capacity);
         string className = sb.ToString();
 
-        return className == "Progman" || className == "WorkerW";
+        return className == "Progman" ||
+               className == "WorkerW" ||
+               className == "Shell_TrayWnd" ||
+               className == "Shell_SecondaryTrayWnd";
     }
 
     private static bool IsNormalUserWindow(IntPtr hwnd)
@@ -422,10 +409,13 @@ static class Program
         _pollTimer?.Stop();
         _pollTimer?.Dispose();
 
+        if (_appVisibility != null && _appVisibilityCookie != 0)
+        {
+            try { _appVisibility.Unadvise(_appVisibilityCookie); } catch { }
+        }
+
         if (_hookForeground != IntPtr.Zero) UnhookWinEvent(_hookForeground);
-        if (_hookShowHide != IntPtr.Zero) UnhookWinEvent(_hookShowHide);
         if (_hookLocation != IntPtr.Zero) UnhookWinEvent(_hookLocation);
-        if (_hookCloak != IntPtr.Zero) UnhookWinEvent(_hookCloak);
 
         if (_trayIcon != null)
         {
